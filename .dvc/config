@@ -1,0 +1,4 @@
+[core]
+    remote = storage
+['remote "storage"']
+    url = s3://ai-lab-mlops-277707107390-20260625/dvc
