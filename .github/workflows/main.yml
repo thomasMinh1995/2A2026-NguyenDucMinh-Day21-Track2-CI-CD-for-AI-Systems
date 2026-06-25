@@ -1,0 +1,168 @@
+name: MLOps Pipeline
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'data/**.dvc'
+      - 'src/**.py'
+      - 'params.yaml'
+  workflow_dispatch:
+
+jobs:
+
+  # JOB 1: Chạy unit tests cục bộ trên môi trường sạch
+  test:
+    name: Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest tests/ -v
+
+  # JOB 2: Huấn luyện mô hình, ghi nhận kết quả và upload model lên S3
+  train:
+    name: Train Model
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Pull data with DVC
+        run: dvc pull
+
+      - name: Train model
+        run: python src/train.py
+
+      - name: Read metrics
+        id: read_metrics
+        run: |
+          accuracy=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
+          echo "accuracy=$accuracy" >> $GITHUB_OUTPUT
+          echo "Read accuracy: $accuracy"
+
+      - name: Upload model to S3
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          python - <<'EOF'
+          import boto3
+          import os
+          bucket = os.environ["S3_BUCKET"]
+          s3 = boto3.client("s3")
+          s3.upload_file("models/model.pkl", bucket, "models/model.pkl")
+          print("Successfully uploaded models/model.pkl to S3.")
+          EOF
+
+      - name: Save metrics as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: outputs/metrics.json
+
+  # JOB 3: Kiểm tra chất lượng mô hình (Eval Gate)
+  eval:
+    name: Evaluate Model
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check eval gate (accuracy >= 0.70)
+        run: |
+          accuracy=${{ needs.train.outputs.accuracy }}
+          echo "Model accuracy: $accuracy"
+          python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.70 else 1)"
+
+  # JOB 4: Triển khai ứng dụng lên EC2 VM qua SSH
+  deploy:
+    name: Deploy to EC2
+    needs: eval
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 1. Clone hoặc cập nhật source code trên EC2
+            if [ ! -d "/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems" ]; then
+              git clone https://github.com/thomasMinh1995/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems.git /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+            else
+              cd /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+              git pull origin master
+            fi
+
+            cd /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+
+            # 2. Tạo môi trường ảo và cài đặt thư viện
+            if [ ! -d ".venv" ]; then
+              python3 -m venv .venv
+            fi
+            .venv/bin/pip install -r requirements.txt
+
+            # 3. Đảm bảo thư mục models tồn tại
+            mkdir -p /home/ec2-user/models
+
+            # 4. Khởi tạo systemd service nếu chưa có
+            if [ ! -f "/etc/systemd/system/mlops-serve.service" ]; then
+              sudo tee /etc/systemd/system/mlops-serve.service > /dev/null <<EOF
+            [Unit]
+            Description=MLOps Model Inference Server
+            After=network.target
+
+            [Service]
+            User=ec2-user
+            WorkingDirectory=/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+            Environment="AWS_S3_BUCKET=ai-lab-mlops-277707107390-20260625"
+            Environment="MODEL_PATH=/home/ec2-user/models/model.pkl"
+            ExecStart=/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems/.venv/bin/uvicorn src.serve:app --host 0.0.0.0 --port 8000
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+              sudo systemctl daemon-reload
+              sudo systemctl enable mlops-serve
+            fi
+
+            # 5. Restart application service
+            sudo systemctl restart mlops-serve
+
+            # 6. Đợi và xác minh dịch vụ
+            sleep 5
+            curl --fail http://localhost:8000/health
