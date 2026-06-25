@@ -6,9 +6,11 @@ on:
     paths:
       - "data/**.dvc"
       - "src/**.py"
+      - "tests/**.py"
       - "params.yaml"
       - "requirements.txt"
       - ".dvc/**"
+      - ".dvcignore"
       - ".github/workflows/mlops.yml"
   workflow_dispatch:
 
@@ -16,6 +18,7 @@ jobs:
   test:
     name: Unit Test
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,6 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -66,43 +70,76 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Debug DVC config
+      - name: Debug repository and DVC
         run: |
-          echo "Current directory:"
+          echo "PWD:"
           pwd
 
-          echo "Git files:"
+          echo "Git tracked DVC files:"
           git ls-files | grep -E "data/.*\.dvc|\.dvc/config|\.dvcignore" || true
 
           echo "DVC version:"
           dvc --version
 
           echo "DVC remote list:"
-          dvc remote list
+          dvc remote list || true
 
           echo ".dvc/config:"
-          cat .dvc/config
+          cat .dvc/config || true
 
           echo "Data directory before dvc pull:"
           ls -lah data || true
 
       - name: Pull data with DVC
         run: |
+          set -e
+
           dvc pull -v
 
           echo "Data directory after dvc pull:"
-          ls -lah data
+          ls -lah data || true
 
-          test -f data/train_phase1.csv
-          test -f data/eval.csv
-          test -f data/train_phase2.csv
+          echo "CSV files found:"
+          find data -maxdepth 1 -name "*.csv" -print || true
+
+          echo "DVC files found:"
+          find data -maxdepth 1 -name "*.dvc" -print || true
+
+          if [ ! -f data/train_phase1.csv ]; then
+            echo "ERROR: data/train_phase1.csv not found after dvc pull"
+            dvc status -c || true
+            exit 1
+          fi
+
+          if [ ! -f data/eval.csv ]; then
+            echo "ERROR: data/eval.csv not found after dvc pull"
+            dvc status -c || true
+            exit 1
+          fi
+
+          if [ ! -f data/train_phase2.csv ]; then
+            echo "ERROR: data/train_phase2.csv not found after dvc pull"
+            dvc status -c || true
+            exit 1
+          fi
 
       - name: Train model
-        run: python src/train.py
+        run: |
+          set -e
+
+          echo "Verify data before training:"
+          ls -lah data
+          test -f data/train_phase1.csv
+
+          python src/train.py
 
       - name: Read metrics
         id: read_metrics
         run: |
+          set -e
+
+          test -f outputs/metrics.json
+
           accuracy=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
           echo "accuracy=$accuracy" >> "$GITHUB_OUTPUT"
           echo "Read accuracy: $accuracy"
@@ -111,6 +148,10 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
+          set -e
+
+          test -f models/model.pkl
+
           python - <<'EOF'
           import boto3
           import os
@@ -131,11 +172,15 @@ jobs:
     name: Evaluate Model
     needs: train
     runs-on: ubuntu-latest
+
     steps:
       - name: Check eval gate accuracy >= 0.70
         run: |
+          set -e
+
           accuracy="${{ needs.train.outputs.accuracy }}"
           echo "Model accuracy: $accuracy"
+
           python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.70 else 1)"
 
   deploy:
@@ -143,6 +188,7 @@ jobs:
     needs: eval
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+
     steps:
       - name: SSH and deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
