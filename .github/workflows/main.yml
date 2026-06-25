@@ -4,20 +4,23 @@ on:
   push:
     branches: [master]
     paths:
-      - 'data/**.dvc'
-      - 'src/**.py'
-      - 'params.yaml'
+      - "data/**.dvc"
+      - "src/**.py"
+      - "params.yaml"
+      - "requirements.txt"
+      - ".dvc/**"
+      - ".github/workflows/mlops.yml"
   workflow_dispatch:
 
 jobs:
-
-  # JOB 1: Chạy unit tests cục bộ trên môi trường sạch
   test:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,11 +31,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "dvc[s3]"
 
       - name: Run pytest
         run: pytest tests/ -v
 
-  # JOB 2: Huấn luyện mô hình, ghi nhận kết quả và upload model lên S3
   train:
     name: Train Model
     needs: test
@@ -42,6 +45,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -52,6 +57,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "dvc[s3]"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -60,8 +66,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Debug DVC config
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Git files:"
+          git ls-files | grep -E "data/.*\.dvc|\.dvc/config|\.dvcignore" || true
+
+          echo "DVC version:"
+          dvc --version
+
+          echo "DVC remote list:"
+          dvc remote list
+
+          echo ".dvc/config:"
+          cat .dvc/config
+
+          echo "Data directory before dvc pull:"
+          ls -lah data || true
+
       - name: Pull data with DVC
-        run: dvc pull
+        run: |
+          dvc pull -v
+
+          echo "Data directory after dvc pull:"
+          ls -lah data
+
+          test -f data/train_phase1.csv
+          test -f data/eval.csv
+          test -f data/train_phase2.csv
 
       - name: Train model
         run: python src/train.py
@@ -70,7 +104,7 @@ jobs:
         id: read_metrics
         run: |
           accuracy=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
-          echo "accuracy=$accuracy" >> $GITHUB_OUTPUT
+          echo "accuracy=$accuracy" >> "$GITHUB_OUTPUT"
           echo "Read accuracy: $accuracy"
 
       - name: Upload model to S3
@@ -80,6 +114,7 @@ jobs:
           python - <<'EOF'
           import boto3
           import os
+
           bucket = os.environ["S3_BUCKET"]
           s3 = boto3.client("s3")
           s3.upload_file("models/model.pkl", bucket, "models/model.pkl")
@@ -92,19 +127,17 @@ jobs:
           name: metrics
           path: outputs/metrics.json
 
-  # JOB 3: Kiểm tra chất lượng mô hình (Eval Gate)
   eval:
     name: Evaluate Model
     needs: train
     runs-on: ubuntu-latest
     steps:
-      - name: Check eval gate (accuracy >= 0.70)
+      - name: Check eval gate accuracy >= 0.70
         run: |
-          accuracy=${{ needs.train.outputs.accuracy }}
+          accuracy="${{ needs.train.outputs.accuracy }}"
           echo "Model accuracy: $accuracy"
           python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.70 else 1)"
 
-  # JOB 4: Triển khai ứng dụng lên EC2 VM qua SSH
   deploy:
     name: Deploy to EC2
     needs: eval
@@ -118,51 +151,52 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # 1. Clone hoặc cập nhật source code trên EC2
-            if [ ! -d "/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems" ]; then
-              git clone https://github.com/thomasMinh1995/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems.git /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+            set -e
+
+            PROJECT_DIR="/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems"
+            REPO_URL="https://github.com/thomasMinh1995/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems.git"
+
+            if [ ! -d "$PROJECT_DIR/.git" ]; then
+              rm -rf "$PROJECT_DIR"
+              git clone "$REPO_URL" "$PROJECT_DIR"
             else
-              cd /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+              cd "$PROJECT_DIR"
               git pull origin master
             fi
 
-            cd /home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
+            cd "$PROJECT_DIR"
 
-            # 2. Tạo môi trường ảo và cài đặt thư viện
             if [ ! -d ".venv" ]; then
               python3 -m venv .venv
             fi
+
+            .venv/bin/python -m pip install --upgrade pip
             .venv/bin/pip install -r requirements.txt
 
-            # 3. Đảm bảo thư mục models tồn tại
             mkdir -p /home/ec2-user/models
 
-            # 4. Khởi tạo systemd service nếu chưa có
-            if [ ! -f "/etc/systemd/system/mlops-serve.service" ]; then
-              sudo tee /etc/systemd/system/mlops-serve.service > /dev/null <<EOF
+            sudo tee /etc/systemd/system/mlops-serve.service > /dev/null <<EOF
             [Unit]
             Description=MLOps Model Inference Server
             After=network.target
 
             [Service]
             User=ec2-user
-            WorkingDirectory=/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems
-            Environment="AWS_S3_BUCKET=ai-lab-mlops-277707107390-20260625"
+            WorkingDirectory=$PROJECT_DIR
+            Environment="AWS_S3_BUCKET=${{ secrets.S3_BUCKET }}"
             Environment="MODEL_PATH=/home/ec2-user/models/model.pkl"
-            ExecStart=/home/ec2-user/2A2026-NguyenDucMinh-Day21-Track2-CI-CD-for-AI-Systems/.venv/bin/uvicorn src.serve:app --host 0.0.0.0 --port 8000
+            ExecStart=$PROJECT_DIR/.venv/bin/uvicorn src.serve:app --host 0.0.0.0 --port 8000
             Restart=always
             RestartSec=5
 
             [Install]
             WantedBy=multi-user.target
             EOF
-              sudo systemctl daemon-reload
-              sudo systemctl enable mlops-serve
-            fi
 
-            # 5. Restart application service
+            sudo systemctl daemon-reload
+            sudo systemctl enable mlops-serve
             sudo systemctl restart mlops-serve
 
-            # 6. Đợi và xác minh dịch vụ
             sleep 5
+            sudo systemctl status mlops-serve --no-pager
             curl --fail http://localhost:8000/health
