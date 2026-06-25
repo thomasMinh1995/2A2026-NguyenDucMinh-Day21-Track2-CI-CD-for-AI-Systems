@@ -3,15 +3,6 @@ name: MLOps Pipeline
 on:
   push:
     branches: [master]
-    paths:
-      - "data/**.dvc"
-      - "src/**.py"
-      - "tests/**.py"
-      - "params.yaml"
-      - "requirements.txt"
-      - ".dvc/**"
-      - ".dvcignore"
-      - ".github/workflows/mlops.yml"
   workflow_dispatch:
 
 jobs:
@@ -22,8 +13,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -49,8 +38,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -70,88 +57,30 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Debug repository and DVC
-        run: |
-          echo "PWD:"
-          pwd
-
-          echo "Git tracked DVC files:"
-          git ls-files | grep -E "data/.*\.dvc|\.dvc/config|\.dvcignore" || true
-
-          echo "DVC version:"
-          dvc --version
-
-          echo "DVC remote list:"
-          dvc remote list || true
-
-          echo ".dvc/config:"
-          cat .dvc/config || true
-
-          echo "Data directory before dvc pull:"
-          ls -lah data || true
-
       - name: Pull data with DVC
         run: |
-          set -e
-
           dvc pull -v
-
-          echo "Data directory after dvc pull:"
-          ls -lah data || true
-
-          echo "CSV files found:"
-          find data -maxdepth 1 -name "*.csv" -print || true
-
-          echo "DVC files found:"
-          find data -maxdepth 1 -name "*.dvc" -print || true
-
-          if [ ! -f data/train_phase1.csv ]; then
-            echo "ERROR: data/train_phase1.csv not found after dvc pull"
-            dvc status -c || true
-            exit 1
-          fi
-
-          if [ ! -f data/eval.csv ]; then
-            echo "ERROR: data/eval.csv not found after dvc pull"
-            dvc status -c || true
-            exit 1
-          fi
-
-          if [ ! -f data/train_phase2.csv ]; then
-            echo "ERROR: data/train_phase2.csv not found after dvc pull"
-            dvc status -c || true
-            exit 1
-          fi
+          ls -lah data
+          test -f data/train_phase1.csv
+          test -f data/eval.csv
+          test -f data/train_phase2.csv
 
       - name: Train model
         run: |
-          set -e
-
-          echo "Verify data before training:"
-          ls -lah data
-          test -f data/train_phase1.csv
-
           python src/train.py
 
       - name: Read metrics
         id: read_metrics
         run: |
-          set -e
-
-          test -f outputs/metrics.json
-
           accuracy=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
           echo "accuracy=$accuracy" >> "$GITHUB_OUTPUT"
-          echo "Read accuracy: $accuracy"
+          echo "Accuracy: $accuracy"
 
       - name: Upload model to S3
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
-          set -e
-
           test -f models/model.pkl
-
           python - <<'EOF'
           import boto3
           import os
@@ -159,10 +88,10 @@ jobs:
           bucket = os.environ["S3_BUCKET"]
           s3 = boto3.client("s3")
           s3.upload_file("models/model.pkl", bucket, "models/model.pkl")
-          print("Successfully uploaded models/model.pkl to S3.")
+          print("Uploaded models/model.pkl to S3")
           EOF
 
-      - name: Save metrics as artifact
+      - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
         with:
           name: metrics
@@ -174,23 +103,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check eval gate accuracy >= 0.70
+      - name: Check accuracy gate
         run: |
-          set -e
-
           accuracy="${{ needs.train.outputs.accuracy }}"
-          echo "Model accuracy: $accuracy"
-
+          echo "Accuracy: $accuracy"
           python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.70 else 1)"
 
   deploy:
     name: Deploy to EC2
     needs: eval
-    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
 
     steps:
-      - name: SSH and deploy to EC2
+      - name: SSH and deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -244,5 +170,4 @@ jobs:
             sudo systemctl restart mlops-serve
 
             sleep 5
-            sudo systemctl status mlops-serve --no-pager
             curl --fail http://localhost:8000/health
