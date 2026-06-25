@@ -3,6 +3,10 @@ name: MLOps Pipeline
 on:
   push:
     branches: [master]
+    paths:
+      - 'data/**.dvc'
+      - 'src/**.py'
+      - 'params.yaml'
   workflow_dispatch:
 
 jobs:
@@ -107,7 +111,7 @@ jobs:
         run: |
           accuracy="${{ needs.train.outputs.accuracy }}"
           echo "Accuracy: $accuracy"
-          python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.68 else 1)"
+          python -c "import sys; sys.exit(0 if float('$accuracy') >= 0.70 else 1)"
 
   deploy:
     name: Deploy to EC2
